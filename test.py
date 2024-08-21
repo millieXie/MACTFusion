@@ -1,116 +1,126 @@
-import cv2
-import numpy as np
+# coding:utf-8
 import os
-import torch
+import argparse
 import time
-from PIL import Image, ImageOps
-from Fusionnet import MACTFusion as net
+import numpy as np
 
-# from loss import Fusionloss
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-model = net(output=1)
-model_path = "./modelpath/cross/fusion_model.pth"
-use_gpu = torch.cuda.is_available()
-
-if use_gpu:
-    model = model.to(device)
-    model.load_state_dict(torch.load(model_path))
-else:
-    state_dict = torch.load(model_path, map_location='cpu')
-    model.load_state_dict(state_dict)
+# os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+import torch
+import torch.nn.functional as F
+from torch.autograd import Variable
+from torch.utils.data import DataLoader
+from TaskFusion_dataset import Fusion_dataset
+from Fusionnet import MACTFusion
+from torch.autograd import Variable
+from PIL import Image
 
 
-def imresize(arr, size, interp='bilinear', mode=None):
-    numpydata = np.asarray(arr)
-    im = Image.fromarray(numpydata, mode=mode)
-    ts = type(size)
-    if np.issubdtype(ts, np.signedinteger):
-        percent = size / 100.0
-        size = tuple((np.array(im.size) * percent).astype(int))
-    elif np.issubdtype(type(size), np.floating):
-        size = tuple((np.array(im.size) * size).astype(int))
-    else:
-        size = (size[1], size[0])
-    func = {'nearest': 0, 'lanczos': 1, 'bilinear': 2, 'bicubic': 3, 'cubic': 3}
-    imnew = im.resize(size, resample=func[interp])
-    return np.array(imnew)
+# To run, set the fused_dir, and the val path in the TaskFusionDataset.py
+def main():
+    fusion_model_path = 'fusion_model.pth'
+    fusionmodel = eval('my_Fusion_new')(output=1)
+    device = torch.device("cuda:{}".format(args.gpu) if torch.cuda.is_available() else "cpu")
+    if args.gpu >= 0:
+        fusionmodel.to(device)
+    fusionmodel.load_state_dict(torch.load(fusion_model_path))
+    print('fusionmodel load done!')
+    ir_path = 'path1'
+    vi_path = 'path2'
+    test_dataset = Fusion_dataset('test', ir_path=ir_path, vi_path=vi_path,length = 21)
+    # test_dataset = Fusion_dataset('val')
+    test_loader = DataLoader(
+        dataset=test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    test_loader.n_iter = len(test_loader)
+    with torch.no_grad():
+        for it, (images_vis, images_ir,name) in enumerate(test_loader):
+            images_vis = Variable(images_vis)
+            images_ir = Variable(images_ir)
+            if args.gpu >= 0:
+                images_vis = images_vis.to(device)
+                images_ir = images_ir.to(device)
+            images_vis_ycrcb = RGB2YCrCb(images_vis)
+            logits = fusionmodel(images_vis_ycrcb, images_ir)
+            fusion_ycrcb = torch.cat(
+                (logits, images_vis_ycrcb[:, 1:2, :, :], images_vis_ycrcb[:, 2:, :, :]),
+                dim=1,
+            )
+            fusion_image = YCrCb2RGB(fusion_ycrcb)
+            ones = torch.ones_like(fusion_image)
+            zeros = torch.zeros_like(fusion_image)
+            fusion_image = torch.where(fusion_image > ones, ones, fusion_image)
+            fusion_image = torch.where(fusion_image < zeros, zeros, fusion_image)
+            fused_image = fusion_image.cpu().numpy()
+            fused_image = fused_image.transpose((0, 2, 3, 1))
+            fused_image = (fused_image - np.min(fused_image)) / (
+                np.max(fused_image) - np.min(fused_image)
+            )
 
+            fused_image = np.uint8(255.0 * fused_image)
+            for k in range(len(name)):
+                image = fused_image[k, :, :, :]
+                image = Image.fromarray(image)
+                save_path = os.path.join(fused_dir, name[k])
+                image.save(save_path)
+                print('Fusion {0} Sucessfully!'.format(save_path))
 
-def resize(image1, image2, crop_size_img, crop_size_label):
-    image1 = imresize(image1, crop_size_img, interp='bicubic')
-    image2 = imresize(image2, crop_size_label, interp='bicubic')
-    return image1, image2
+def YCrCb2RGB(input_im):
+    device = torch.device("cuda:{}".format(args.gpu) if torch.cuda.is_available() else "cpu")
+    im_flat = input_im.transpose(1, 3).transpose(1, 2).reshape(-1, 3)
+    mat = torch.tensor(
+        [[1.0, 1.0, 1.0], [1.403, -0.714, 0.0], [0.0, -0.344, 1.773]]
+    ).to(device)
+    bias = torch.tensor([0.0 / 255, -0.5, -0.5]).to(device)
+    temp = (im_flat + bias).mm(mat).to(device)
+    out = (
+        temp.reshape(
+            list(input_im.size())[0],
+            list(input_im.size())[2],
+            list(input_im.size())[3],
+            3,
+        )
+        .transpose(1, 3)
+        .transpose(2, 3)
+    )
+    return out
 
-
-def get_image_files(input_folder):
-    # 获取指定文件夹中的所有图像文件
-    valid_extensions = (".bmp", ".tif", ".jpg", ".jpeg", ".png")
-    return sorted([f for f in os.listdir(input_folder) if f.lower().endswith(valid_extensions)])
-
-
-def fusion(input_folder_ir, input_folder_vis, output_folder):
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-    tic = time.time()
-    # criteria_fusion = Fusionloss()
-
-    ir_images = get_image_files(input_folder_ir)
-    vis_images = get_image_files(input_folder_vis)
-
-    for ir_image, vis_image in zip(ir_images, vis_images):
-        path1 = os.path.join(input_folder_ir, ir_image)
-        path2 = os.path.join(input_folder_vis, vis_image)
-
-        # 读取灰度图像
-        img1 = cv2.imread(path1, cv2.IMREAD_GRAYSCALE)
-        img2 = cv2.imread(path2, cv2.IMREAD_GRAYSCALE)
-
-        # 调整图像大小
-        img1, img2 = resize(img1, img2, [256, 256], [256, 256])
-
-        # 归一化图像
-        img1 = np.asarray(img1, dtype=np.float32) / 255.0
-        img2 = np.asarray(img2, dtype=np.float32) / 255.0
-
-        # 扩展维度
-        img1 = np.expand_dims(img1, axis=0)
-        img2 = np.expand_dims(img2, axis=0)
-
-        # 转换为张量
-        img1_tensor = torch.from_numpy(img1).unsqueeze(0).to(device)
-        img2_tensor = torch.from_numpy(img2).unsqueeze(0).to(device)
-
-        model.eval()
-        with torch.no_grad():
-            out = model(img1_tensor, img2_tensor)
-
-            # 将张量转换为 NumPy 数组
-            out_np = out.cpu().numpy()
-
-            # 归一化输出
-            out_np = (out_np - np.min(out_np)) / (np.max(out_np) - np.min(out_np))
-
-        # 处理和保存结果
-        d = np.squeeze(out_np)
-        result = (d * 255).astype(np.uint8)
-
-        # 获取文件扩展名，并保持与输入文件相同的格式
-        output_filename = os.path.splitext(ir_image)[0] + os.path.splitext(ir_image)[1]
-        output_path = os.path.join(output_folder, output_filename)
-        cv2.imwrite(output_path, result)
-
-    toc = time.time()
-    print('Processing time: {}'.format(toc - tic))
-
-
+def RGB2YCrCb(input_im):
+    device = torch.device("cuda:{}".format(args.gpu) if torch.cuda.is_available() else "cpu")
+    im_flat = input_im.transpose(1, 3).transpose(1, 2).reshape(-1, 3)  # (nhw,c)
+    R = im_flat[:, 0]
+    G = im_flat[:, 1]
+    B = im_flat[:, 2]
+    Y = 0.299 * R + 0.587 * G + 0.114 * B
+    Cr = (R - Y) * 0.713 + 0.5
+    Cb = (B - Y) * 0.564 + 0.5
+    Y = torch.unsqueeze(Y, 1)
+    Cr = torch.unsqueeze(Cr, 1)
+    Cb = torch.unsqueeze(Cb, 1)
+    temp = torch.cat((Y, Cr, Cb), dim=1).to(device)
+    out = (
+        temp.reshape(
+            list(input_im.size())[0],
+            list(input_im.size())[2],
+            list(input_im.size())[3],
+            3,
+        )
+        .transpose(1, 3)
+        .transpose(2, 3)
+    )
+    return out
 if __name__ == '__main__':
-    input_folder_1 = 'path1'
-    input_folder_2 = 'path2'
-    output_folder = './fusion'
-
-    fusion(input_folder_2, input_folder_1, output_folder)
+    parser = argparse.ArgumentParser(description='Run MyFusion with pytorch')
+    parser.add_argument('--model_name', '-M', type=str, default='my_Fusion_new')
+    parser.add_argument('--batch_size', '-B', type=int, default=1)
+    parser.add_argument('--gpu', '-G', type=int, default=0)
+    parser.add_argument('--num_workers', '-j', type=int, default=1)
+    args = parser.parse_args()
+    fused_dir = 'CTMRI'
+    os.makedirs(fused_dir, mode=0o777, exist_ok=True)
+    print('| testing %s on GPU #%d with pytorch' % (args.model_name, args.gpu))
+    main()
