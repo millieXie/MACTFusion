@@ -18,7 +18,7 @@ from PIL import Image
 # To run, set the fused_dir, and the val path in the TaskFusionDataset.py
 def main():
     fusion_model_path = 'fusion_model.pth'
-    fusionmodel = eval('my_Fusion_new')(output=1)
+    fusionmodel = eval('MACTFusion')(output=1)
     device = torch.device("cuda:{}".format(args.gpu) if torch.cuda.is_available() else "cpu")
     if args.gpu >= 0:
         fusionmodel.to(device)
